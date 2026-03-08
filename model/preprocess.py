@@ -234,22 +234,13 @@ def scanpy_workflow(
         X = adata.X.toarray() if sp.issparse(adata.X) else adata.X
         has_neg = (np.min(X) < 0)
 
-    # --- Step 4/5: normalize and log1p if safe ---
-    has_neg = (adata.X.min() < 0) if not sp.issparse(adata.X) else (adata.X.min() < 0)
-
-    if start_from_counts and (not has_neg):
-        sc.pp.normalize_total(adata, target_sum=1e4)
-        sc.pp.log1p(adata)
-    else:
-        print("⚠️ Detected processed data (negative values or non-counts). Skip normalize_total/log1p.")
-
-    # --- Step 5: decide whether to normalize/log1p ---
+    # --- Step 5: normalize/log1p ONCE for count-like data ---
     is_counts_like = False
     if not has_neg:
         try:
-            is_counts_like = start_from_counts or looks_like_counts(adata.X)
+            is_counts_like = bool(start_from_counts or looks_like_counts(adata.X))
         except Exception:
-            is_counts_like = start_from_counts
+            is_counts_like = bool(start_from_counts)
 
     if (not has_neg) and is_counts_like:
         sc.pp.normalize_total(adata, target_sum=1e4)
