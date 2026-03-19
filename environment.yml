@@ -1,0 +1,35 @@
+name: sp
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - pytorch=2.5.0
+  - torchvision
+  - torchaudio
+  - pytorch-cuda=12.1
+  - numpy<2.0
+  - scipy>=1.9
+  - pandas>=1.5
+  - numexpr>=2.8.4
+  - bottleneck>=1.3.6
+  - matplotlib>=3.6
+  - scikit-learn>=1.2
+  - tqdm>=4.65
+  - scanpy>=1.9
+  - anndata>=0.9
+  - louvain>=0.8
+  - leidenalg>=0.9
+  - python-igraph>=0.10
+  - rpy2>=3.5
+  - pip>=23.0
+  - pip:
+      - nvidia-ml-py
+      # torch-geometric and its compiled deps should be installed manually
+      # against the exact PyTorch/CUDA build in this environment.
+      #
+      #   pip install torch-scatter torch-sparse torch-cluster torch-spline-conv \
+      #       -f https://data.pyg.org/whl/torch-2.5.0+cu121.html
+      #   pip install torch-geometric

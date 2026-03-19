@@ -26,7 +26,7 @@ from model.encoder import (
 )
 
 
-def set_seed(seed: int = 0):
+def set_seed(seed: int = 0, strict: bool = False):
     import random
 
     os.environ["PYTHONHASHSEED"] = str(seed)
@@ -44,9 +44,35 @@ def set_seed(seed: int = 0):
         torch.backends.cudnn.benchmark = False
 
     try:
-        torch.use_deterministic_algorithms(True, warn_only=True)
+        if strict:
+            torch.use_deterministic_algorithms(True, warn_only=False)
+        else:
+            torch.use_deterministic_algorithms(False)
     except Exception:
         pass
+
+    if strict and torch.cuda.is_available() and "CUBLAS_WORKSPACE_CONFIG" not in os.environ:
+        print(
+            "Strict deterministic mode enabled without CUBLAS_WORKSPACE_CONFIG. "
+            "Set CUBLAS_WORKSPACE_CONFIG=:4096:8 before launch for CuBLAS determinism."
+        )
+
+
+def unique_trainable_params(*modules):
+    seen = set()
+    params = []
+    for module in modules:
+        if module is None:
+            continue
+        for p in module.parameters():
+            if p is None or not p.requires_grad:
+                continue
+            pid = id(p)
+            if pid in seen:
+                continue
+            seen.add(pid)
+            params.append(p)
+    return params
 
 def _infer_layer_key(adata, user_layer_key, allow_fallback: bool = True):
 
@@ -135,7 +161,7 @@ def _apply_spot_feature_mask(
 
 
 def main(a):
-    set_seed(a.seed)
+    set_seed(a.seed, strict=getattr(a, "strict_determinism", False))
     adata = ad.read_h5ad(a.h5)
 
     # ---------- output prefix (avoid overwrite) ----------
@@ -349,9 +375,7 @@ def main(a):
             f"recon_target={a.recon_target}."
         )
 
-    params = list(enc.parameters()) + list(scorer.parameters())
-    if feat_decoder is not None:
-        params += list(feat_decoder.parameters())
+    params = unique_trainable_params(enc, scorer, feat_decoder)
 
     opt = torch.optim.Adam(
         params,
@@ -492,10 +516,7 @@ def main(a):
         # backward and update
         opt.zero_grad()
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(
-            list(enc.parameters()) + list(scorer.parameters()),
-            max_norm=5.0,
-        )
+        torch.nn.utils.clip_grad_norm_(params, max_norm=5.0)
         opt.step()
 
         if a.scheduler:
@@ -602,6 +623,7 @@ if __name__ == "__main__":
     p.add_argument("--pos_per_epoch", type=int, default=20000)
     p.add_argument("--embed_agg", choices=["concat", "mean", "last"], default="concat")
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--strict_determinism", action="store_true", help="Enable strict deterministic algorithms. Slower and may require CUBLAS_WORKSPACE_CONFIG=:4096:8 before launch.")
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--use_rep", type=str, default="")
     p.add_argument("--device",default="cuda" if torch.cuda.is_available() else "cpu",)

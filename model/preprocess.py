@@ -266,7 +266,13 @@ def scanpy_workflow(
     if viz:
         sc.pp.neighbors(adata, n_neighbors=15, n_pcs=n_comps)
         sc.tl.umap(adata)
-        sc.tl.leiden(adata, resolution=resolution)
+        sc.tl.leiden(
+            adata,
+            resolution=resolution,
+            flavor="igraph",
+            directed=False,
+            n_iterations=2,
+        )
 
     return adata
 
