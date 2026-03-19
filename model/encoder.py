@@ -62,6 +62,76 @@ def _pairwise_dot_scores(
         scores.append((h[i_idx[st:ed]] * h[j_idx[st:ed]]).sum(dim=1))
     return torch.cat(scores, dim=0)
 
+
+def deterministic_weighted_sample(
+    prob: torch.Tensor,
+    num_samples: int,
+    offset: int = 0,
+) -> torch.Tensor:
+    """
+    Strict-compatible weighted sampling without torch.multinomial().
+    """
+    assert prob.dim() == 1
+    device = prob.device
+    n = int(prob.numel())
+
+    if n == 0 or num_samples <= 0:
+        return torch.empty(0, dtype=torch.long, device=device)
+
+    weight = prob.float().clamp_min(0)
+    positive = weight > 0
+    if positive.any():
+        idx = torch.arange(n, device=device, dtype=torch.long)[positive]
+        p = weight[positive]
+        p = p / p.sum().clamp_min(1e-12)
+    else:
+        idx = torch.arange(n, device=device, dtype=torch.long)
+        p = torch.full((n,), 1.0 / max(1, n), dtype=torch.float32, device=device)
+
+    scale = max(int(num_samples), 4096)
+    counts = torch.round(p * scale).to(torch.long)
+    counts = torch.clamp(counts, min=1)
+    expanded = torch.repeat_interleave(idx, counts)
+    if expanded.numel() == 0:
+        expanded = idx
+
+    anchor = int(idx[torch.argmax(p)].item()) if idx.numel() > 0 else 0
+    shift = int((offset + anchor * 131 + int(num_samples) * 17) % max(1, expanded.numel()))
+    expanded = torch.roll(expanded, shifts=shift)
+
+    if expanded.numel() >= num_samples:
+        return expanded[:num_samples]
+
+    repeat = (num_samples + expanded.numel() - 1) // expanded.numel()
+    return expanded.repeat(repeat)[:num_samples]
+
+
+def deterministic_row_weighted_sample(
+    prob: torch.Tensor,
+    row_ids: torch.Tensor,
+    offset: int = 0,
+) -> torch.Tensor:
+    """
+    Row-wise deterministic weighted sampling for probability matrices.
+    """
+    assert prob.dim() == 2
+    device = prob.device
+    row_ids = row_ids.to(device=device, dtype=torch.long)
+    out = torch.empty(row_ids.numel(), dtype=torch.long, device=device)
+    if row_ids.numel() == 0:
+        return out
+
+    for row_id in torch.unique(row_ids).tolist():
+        row_id = int(row_id)
+        mask = row_ids == row_id
+        count = int(mask.sum().item())
+        out[mask] = deterministic_weighted_sample(
+            prob[row_id],
+            count,
+            offset=offset + row_id * 997,
+        )
+    return out
+
 class CollaborativeEncoder(nn.Module):
     def __init__(
         self,
@@ -178,12 +248,14 @@ def sample_negatives(
     normal_scales=None,        # (N,)  numpy or torch (robust scale per i)
     normal_margin: float = 0.0,  # min normalized normal-distance for negatives
     normal_gamma: float = 0.0,   # exp weight on normal-distance
+    deterministic_sampling: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Negative sampling with optional:
       - layer-aware constraints (discrete layer_ids)
       - normal-aware constraints (continuous local normal distance; self-supervised)
       - Scheme-B hard mining (dot-product scoring) + random remainder
+      - strict-compatible deterministic weighted sampling
 
     P: sparse adjacency (torch.sparse_coo_tensor)
     h: node embedding used for hardness scoring (if None, will compute via encoder+Ptilde once)
@@ -300,8 +372,14 @@ def sample_negatives(
         need = n_cand - collected
         batch = int(min(262144, max(base_batch, need * 2)))
 
-        i = torch.multinomial(prob, num_samples=batch, replacement=True)
-        j = torch.multinomial(prob, num_samples=batch, replacement=True)
+        # strict mode: avoid torch.multinomial on CUDA because it is not
+        # compatible with torch.use_deterministic_algorithms(True)
+        if deterministic_sampling:
+            i = deterministic_weighted_sample(prob, batch, offset=attempts * 17)
+            j = deterministic_weighted_sample(torch.roll(prob, shifts=1), batch, offset=attempts * 97)
+        else:
+            i = torch.multinomial(prob, num_samples=batch, replacement=True)
+            j = torch.multinomial(prob, num_samples=batch, replacement=True)
         is_adj = torch.zeros(batch, dtype=torch.bool, device=device)
 
         if layer_ids is not None and n_spot is not None and n_spot > 0 and layer_weight is not None:
@@ -310,7 +388,16 @@ def sample_negatives(
                 i_spot = i[spot_mask]
                 li_spot = layer_ids[i_spot]
 
-                lj_spot = torch.multinomial(layer_weight[li_spot], num_samples=1).squeeze(1)
+                # strict mode: avoid torch.multinomial on CUDA because it is not
+                # compatible with torch.use_deterministic_algorithms(True)
+                if deterministic_sampling:
+                    lj_spot = deterministic_row_weighted_sample(
+                        layer_weight,
+                        li_spot,
+                        offset=attempts * 193,
+                    )
+                else:
+                    lj_spot = torch.multinomial(layer_weight[li_spot], num_samples=1).squeeze(1)
                 is_adj_spot = torch.zeros(li_spot.numel(), dtype=torch.bool, device=device)
 
                 if (neg_adj_ratio is not None) and (float(neg_adj_ratio) > 0) and (max_layer is not None) and (max_layer >= 1):

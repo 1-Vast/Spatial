@@ -54,7 +54,7 @@ def set_seed(seed: int = 0, strict: bool = True):
     if strict and torch.cuda.is_available() and "CUBLAS_WORKSPACE_CONFIG" not in os.environ:
         print(
             "Strict deterministic mode enabled without CUBLAS_WORKSPACE_CONFIG. "
-            "Set CUBLAS_WORKSPACE_CONFIG=:4096:8 before launch for CuBLAS determinism."
+            "Set CUBLAS_WORKSPACE_CONFIG=:4096:8 before launch or source strict_env.sh."
         )
 
 
@@ -482,6 +482,7 @@ def main(a):
             normal_scales=normal_scales,
             normal_margin=float(getattr(a, "normal_margin", 1.0)),
             normal_gamma=float(getattr(a, "normal_gamma", 2.0)),
+            deterministic_sampling=not getattr(a, "no_strict_determinism", False),
         )
 
         ni = ni.to(a.device)

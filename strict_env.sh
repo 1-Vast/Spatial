@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+
+unset OMP_NUM_THREADS
+export OMP_NUM_THREADS=2
+export MKL_NUM_THREADS=2
+export OPENBLAS_NUM_THREADS=2
+export NUMEXPR_NUM_THREADS=2
+export NUMBA_THREADING_LAYER=workqueue
+export CUBLAS_WORKSPACE_CONFIG=:4096:8
