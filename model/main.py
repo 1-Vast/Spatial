@@ -26,7 +26,7 @@ from model.encoder import (
 )
 
 
-def set_seed(seed: int = 0, strict: bool = False):
+def set_seed(seed: int = 0, strict: bool = True):
     import random
 
     os.environ["PYTHONHASHSEED"] = str(seed)
@@ -161,7 +161,7 @@ def _apply_spot_feature_mask(
 
 
 def main(a):
-    set_seed(a.seed, strict=getattr(a, "strict_determinism", False))
+    set_seed(a.seed, strict=not getattr(a, "no_strict_determinism", False))
     adata = ad.read_h5ad(a.h5)
 
     # ---------- output prefix (avoid overwrite) ----------
@@ -623,7 +623,17 @@ if __name__ == "__main__":
     p.add_argument("--pos_per_epoch", type=int, default=20000)
     p.add_argument("--embed_agg", choices=["concat", "mean", "last"], default="concat")
     p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--strict_determinism", action="store_true", help="Enable strict deterministic algorithms. Slower and may require CUBLAS_WORKSPACE_CONFIG=:4096:8 before launch.")
+    p.add_argument(
+        "--no_strict_determinism",
+        action="store_true",
+        help="Disable strict deterministic algorithms for faster training.",
+    )
+    p.add_argument(
+        "--strict_determinism",
+        dest="no_strict_determinism",
+        action="store_false",
+        help=argparse.SUPPRESS,
+    )
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--use_rep", type=str, default="")
     p.add_argument("--device",default="cuda" if torch.cuda.is_available() else "cpu",)

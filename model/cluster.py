@@ -1,5 +1,6 @@
 import argparse
 import os
+import sys
 
 import numpy as np
 import matplotlib
@@ -14,7 +15,7 @@ import scanpy as sc
 import scipy.sparse as sp
 from scipy.sparse import csr_matrix
 
-from sklearn.cluster import KMeans
+from sklearn.cluster import KMeans, MiniBatchKMeans
 from sklearn.metrics import (
     adjusted_rand_score,
     normalized_mutual_info_score,
@@ -57,16 +58,97 @@ def _row_norm(A: sp.spmatrix) -> sp.csr_matrix:
     return inv @ A
 
 
-def _neighbors_from_rep(adata, use_rep: str, n_neighbors: int):
+def _neighbors_from_matrix_gpu(
+    X: np.ndarray,
+    n_neighbors: int,
+    gpu_device: str = "cuda",
+) -> sp.csr_matrix:
+    try:
+        import torch
+        from torch_geometric.nn import knn_graph
+    except Exception as e:
+        raise RuntimeError("GPU neighbors backend requires torch + torch_geometric.") from e
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is not available in current environment.")
+
+    X = np.asarray(X, dtype=np.float32)
+    n_obs = int(X.shape[0])
+    if n_obs <= 1:
+        return csr_matrix((n_obs, n_obs), dtype=np.float32)
+
+    k_eff = max(1, min(int(n_neighbors), n_obs - 1))
+    x_t = torch.tensor(X, dtype=torch.float32, device=gpu_device)
+    edge_index = knn_graph(x_t, k=k_eff, loop=False, flow="target_to_source")
+    edge_index = edge_index.detach().cpu().numpy()
+    row, col = edge_index[0], edge_index[1]
+    data = np.ones(row.shape[0], dtype=np.float32)
+    A = csr_matrix((data, (row, col)), shape=(n_obs, n_obs), dtype=np.float32)
+    A = _ensure_undirected(A)
+    A = A.tocsr()
+    A.setdiag(0)
+    A.eliminate_zeros()
+    return A
+
+
+def _set_neighbors_graph(adata, A: sp.spmatrix, backend: str, n_neighbors: int):
+    A = _ensure_undirected(A).tocsr().astype(np.float32)
+    A.setdiag(0)
+    A.eliminate_zeros()
+    adata.obsp["connectivities"] = A
+    adata.obsp["distances"] = A.copy()
+    adata.uns["neighbors"] = {
+        "params": {"method": str(backend), "n_neighbors": int(n_neighbors)},
+        "connectivities_key": "connectivities",
+        "distances_key": "distances",
+    }
+
+
+def _neighbors_from_rep(
+    adata,
+    use_rep: str,
+    n_neighbors: int,
+    backend: str = "scanpy",
+    gpu_device: str = "cuda",
+):
     if use_rep not in adata.obsm:
         raise KeyError(f"obsm['{use_rep}'] not found.")
+
+    backend = str(backend).lower().strip()
+    if backend in ("gpu", "auto"):
+        try:
+            A = _neighbors_from_matrix_gpu(adata.obsm[use_rep], n_neighbors, gpu_device=gpu_device)
+            _set_neighbors_graph(adata, A, backend=f"gpu:{gpu_device}", n_neighbors=n_neighbors)
+            return
+        except Exception as e:
+            if backend == "gpu":
+                raise
+            print(f"[neighbors] GPU backend unavailable ({e}); fallback to scanpy.", flush=True)
+
     sc.pp.neighbors(adata, use_rep=use_rep, n_neighbors=int(n_neighbors))
 
 
-def _neighbors_from_embedding(adata, Z: np.ndarray, knn_k: int = 15):
+def _neighbors_from_embedding(
+    adata,
+    Z: np.ndarray,
+    knn_k: int = 15,
+    backend: str = "scanpy",
+    gpu_device: str = "cuda",
+):
     """
     Build neighbors based on embedding Z and store in adata.obsp["connectivities"].
     """
+    backend = str(backend).lower().strip()
+    if backend in ("gpu", "auto"):
+        try:
+            A = _neighbors_from_matrix_gpu(Z, knn_k, gpu_device=gpu_device)
+            _set_neighbors_graph(adata, A, backend=f"gpu:{gpu_device}", n_neighbors=knn_k)
+            return
+        except Exception as e:
+            if backend == "gpu":
+                raise
+            print(f"[neighbors] GPU backend unavailable ({e}); fallback to scanpy.", flush=True)
+
     adata.obsm["X_tmp"] = Z
     sc.pp.neighbors(adata, use_rep="X_tmp", n_neighbors=int(knn_k))
     del adata.obsm["X_tmp"]
@@ -78,12 +160,33 @@ def build_hybrid_adj(
     use_rep: str = "X",
     w_spa: float = 0.7,
     w_emb: float = 0.3,
+    neighbors_backend: str = "scanpy",
+    neighbors_gpu_device: str = "cuda",
 ):
     assert "A_spatial" in adata.obsp, "missing adata.obsp['A_spatial']"
     A_spa = _ensure_undirected(adata.obsp["A_spatial"])
 
-    _neighbors_from_rep(adata, use_rep=use_rep, n_neighbors=n_neighbors_emb)
-    A_emb = _ensure_undirected(adata.obsp["connectivities"])
+    cache_backend = str(neighbors_backend).lower().strip()
+    rep_mat = adata.obsm[use_rep] if use_rep in adata.obsm else adata.X
+    rep_shape = tuple(rep_mat.shape)
+    rep_n = int(rep_shape[0]) if len(rep_shape) > 0 else int(adata.n_obs)
+    rep_d = int(rep_shape[1]) if len(rep_shape) > 1 else 1
+    cache_key = (
+        f"A_emb_{str(use_rep)}_k{int(n_neighbors_emb)}_{cache_backend}"
+        f"_n{rep_n}_d{rep_d}"
+    )
+    if cache_key in adata.obsp:
+        A_emb = _ensure_undirected(adata.obsp[cache_key])
+    else:
+        _neighbors_from_rep(
+            adata,
+            use_rep=use_rep,
+            n_neighbors=n_neighbors_emb,
+            backend=neighbors_backend,
+            gpu_device=neighbors_gpu_device,
+        )
+        A_emb = _ensure_undirected(adata.obsp["connectivities"])
+        adata.obsp[cache_key] = A_emb.copy()
 
     A_hyb = _row_norm(A_spa).multiply(w_spa) + _row_norm(A_emb).multiply(w_emb)
     A_hyb = A_hyb.tocsr()
@@ -173,29 +276,33 @@ def spatial_knn_smooth_embedding(
 def mrf_majority_smooth(A_spa: sp.spmatrix, y: np.ndarray, n_iter: int = 2) -> np.ndarray:
     A = _ensure_undirected(A_spa).tocsr()
     y = np.asarray(y).copy()
+    n_iter = int(n_iter)
+    if n_iter <= 0 or y.size == 0:
+        return y
 
-    # Precompute neighbor list for each node from CSR structure
-    indptr = A.indptr
-    indices = A.indices
-    neighbor_ids = [indices[indptr[i]:indptr[i + 1]] for i in range(A.shape[0])]
+    # Keep the original "neighbor count vote" semantics (ignore edge weights).
+    A_bin = A.copy().tocsr()
+    A_bin.data = np.ones_like(A_bin.data, dtype=np.float32)
+    deg = np.diff(A_bin.indptr).astype(np.float32)
 
-    for _ in range(int(n_iter)):
-        y_new = y.copy()
-        for i, nbr in enumerate(neighbor_ids):
-            if nbr.size == 0:
-                continue
+    uniq_labels, y_idx = np.unique(y, return_inverse=True)
+    n_nodes = y_idx.shape[0]
+    n_classes = uniq_labels.shape[0]
 
-            # votes from neighbors
-            vs = y[nbr].tolist()
-            major, cnt = Counter(vs).most_common(1)[0]
+    for _ in range(n_iter):
+        onehot = np.zeros((n_nodes, n_classes), dtype=np.float32)
+        onehot[np.arange(n_nodes), y_idx] = 1.0
+        votes = np.asarray(A_bin @ onehot)
 
-            # conservative majority update: require enough support in neighbors
-            if cnt >= max(2, 0.5 * len(vs)):
-                y_new[i] = major
+        major_idx = votes.argmax(axis=1)
+        major_cnt = votes[np.arange(n_nodes), major_idx]
+        support = major_cnt >= np.maximum(2.0, 0.5 * deg)
 
-        y = y_new
+        y_new_idx = y_idx.copy()
+        y_new_idx[support] = major_idx[support]
+        y_idx = y_new_idx
 
-    return y
+    return uniq_labels[y_idx]
 
 
 # ----------------------------------------------------------------------
@@ -259,10 +366,38 @@ def _estimate_k(n: int) -> int:
     return 10
 
 
+def _resolve_scale_mode(n_obs: int, scale_mode: str) -> str:
+    mode = str(scale_mode).lower().strip()
+    if mode in ("small", "medium", "large"):
+        return mode
+    if n_obs <= 10000:
+        return "small"
+    if n_obs <= 50000:
+        return "medium"
+    return "large"
+
+
+def _has_cli_flag(flag: str) -> bool:
+    for arg in sys.argv[1:]:
+        if arg == flag or arg.startswith(flag + "="):
+            return True
+    return False
+
+
+def _run_leiden(adata, **kwargs):
+    sc.tl.leiden(
+        adata,
+        flavor="igraph",
+        directed=False,
+        n_iterations=2,
+        **kwargs,
+    )
+
+
 def run_leiden_on_adjacency(adata, adjacency: sp.spmatrix, resolution: float, key: str, seed: int):
     # 1) First try: newer scanpy supports adjacency=
     try:
-        sc.tl.leiden(
+        _run_leiden(
             adata,
             resolution=float(resolution),
             key_added=key,
@@ -295,7 +430,7 @@ def run_leiden_on_adjacency(adata, adjacency: sp.spmatrix, resolution: float, ke
             "distances_key": "distances",
         }
 
-        sc.tl.leiden(
+        _run_leiden(
             adata,
             resolution=float(resolution),
             key_added=key,
@@ -333,6 +468,11 @@ def robust_consensus_leiden(
     n_seeds: int = 5,
     n_smooth_iter: int = 2,
     random_state: int = 0,
+    consensus_backend: str = "kmeans",
+    consensus_batch_size: int = 8192,
+    neighbors_backend: str = "scanpy",
+    neighbors_gpu_device: str = "cuda",
+    scale_mode: str = "auto",
 ):
     """
     Robust consensus Leiden on hybrid adjacency:
@@ -351,6 +491,8 @@ def robust_consensus_leiden(
         use_rep=use_rep,
         w_spa=w_spa,
         w_emb=w_emb,
+        neighbors_backend=neighbors_backend,
+        neighbors_gpu_device=neighbors_gpu_device,
     )
 
     labels_all = []
@@ -375,14 +517,17 @@ def robust_consensus_leiden(
         raise RuntimeError("No Leiden runs were performed.")
     labels_all = np.stack(labels_all, axis=0)  # [R, N]
 
-    runs_feat = []
+    run_dims = []
     for lab in labels_all:
         lab = lab.astype(int)
-        max_lab = lab.max()
-        onehot = np.zeros((N, max_lab + 1), dtype=np.float32)
-        onehot[np.arange(N), lab] = 1.0
-        runs_feat.append(onehot)
-    meta_feat = np.concatenate(runs_feat, axis=1)  # [N, sum(max_lab+1)]
+        run_dims.append(int(lab.max()) + 1)
+
+    total_dim = int(np.sum(run_dims))
+    meta_feat = np.zeros((N, total_dim), dtype=np.float32)
+    offset = 0
+    for lab, dim_i in zip(labels_all, run_dims):
+        meta_feat[np.arange(N), offset + lab] = 1.0
+        offset += dim_i
 
     if n_clusters is not None and n_clusters > 0:
         k_final = int(n_clusters)
@@ -392,7 +537,16 @@ def robust_consensus_leiden(
         k_final = max(2, k_final)
         print(f"[robust] k_list={k_list} -> k_final={k_final}", flush=True)
 
-    km = KMeans(n_clusters=k_final, n_init=10, random_state=random_state)
+    backend = str(consensus_backend).lower().strip()
+    if backend == "minibatch":
+        km = MiniBatchKMeans(
+            n_clusters=k_final,
+            random_state=random_state,
+            batch_size=max(256, int(consensus_batch_size)),
+            n_init=3,
+        )
+    else:
+        km = KMeans(n_clusters=k_final, n_init=10, random_state=random_state)
     y_robust = km.fit_predict(meta_feat).astype(int)
 
     y_robust_smooth = mrf_majority_smooth(A_spa, y_robust, n_iter=n_smooth_iter)
@@ -407,6 +561,9 @@ def robust_consensus_leiden(
         "n_seeds": int(n_seeds),
         "res_list": [float(r) for r in res_list],
         "n_clusters": int(k_final),
+        "consensus_backend": backend,
+        "neighbors_backend": str(neighbors_backend),
+        "scale_mode": str(scale_mode),
     }
     return y_robust_smooth
 
@@ -523,47 +680,84 @@ def cluster_with_method(
     use_rep: str | None = None,
     w_spa: float = 0.40,
     w_emb: float = 0.60,
-    robust_seeds: int = 5,
-    robust_smooth_iter: int = 2,
+    robust_seeds: int = 3,
+    robust_smooth_iter: int = 1,
     robust_random_state: int = 0,
     robust_res_list: list[float] | None = None,
+    robust_consensus_backend: str = "kmeans",
+    robust_batch_size: int = 8192,
+    neighbors_backend: str = "auto",
+    neighbors_gpu_device: str = "cuda",
+    scale_mode: str = "auto",
 ) -> np.ndarray:
 
     method = method.lower().strip()
     N = int(Z_spot.shape[0])
+    scale_mode_eff = _resolve_scale_mode(N, scale_mode)
 
     if method == "kmeans":
         k = n_clusters if n_clusters and n_clusters > 0 else _estimate_k(N)
-        print(f"[cluster] KMeans, n_clusters={k}")
-        km = KMeans(n_clusters=k, n_init=10, random_state=0)
+        kmeans_n_init = 10 if scale_mode_eff == "small" else 5
+        print(f"[cluster] KMeans, n_clusters={k}, n_init={kmeans_n_init}")
+        km = KMeans(n_clusters=k, n_init=kmeans_n_init, random_state=0)
         labels = km.fit_predict(Z_spot).astype(int)
         adata.obs[key_added] = labels
         adata.obs[key_added] = adata.obs[key_added].astype(int)
         adata.uns[f"{key_added}_params"] = {
             "method": "kmeans",
             "n_clusters": int(k),
+            "n_init": int(kmeans_n_init),
+            "scale_mode": str(scale_mode_eff),
         }
         return labels
 
-    if use_rep is not None and use_rep in adata.obsm:
-        _neighbors_from_rep(adata, use_rep=use_rep, n_neighbors=knn_k)
-    else:
-        _neighbors_from_embedding(adata, Z_spot, knn_k=knn_k)
-
-
     if method == "leiden":
+        if use_rep is not None and use_rep in adata.obsm:
+            _neighbors_from_rep(
+                adata,
+                use_rep=use_rep,
+                n_neighbors=knn_k,
+                backend=neighbors_backend,
+                gpu_device=neighbors_gpu_device,
+            )
+        else:
+            _neighbors_from_embedding(
+                adata,
+                Z_spot,
+                knn_k=knn_k,
+                backend=neighbors_backend,
+                gpu_device=neighbors_gpu_device,
+            )
         res = float(resolution) if resolution is not None else 1.0
         print(f"[cluster] Leiden, resolution={res}, knn_k={knn_k}")
-        sc.tl.leiden(adata, resolution=res, key_added=key_added)
+        _run_leiden(adata, resolution=res, key_added=key_added)
         adata.obs[key_added] = adata.obs[key_added].astype(int)
         adata.uns[f"{key_added}_params"] = {
             "method": "leiden",
             "resolution": float(res),
             "knn_k": int(knn_k),
+            "neighbors_backend": str(neighbors_backend),
+            "scale_mode": str(scale_mode_eff),
         }
         return adata.obs[key_added].to_numpy()
 
     if method == "louvain":
+        if use_rep is not None and use_rep in adata.obsm:
+            _neighbors_from_rep(
+                adata,
+                use_rep=use_rep,
+                n_neighbors=knn_k,
+                backend=neighbors_backend,
+                gpu_device=neighbors_gpu_device,
+            )
+        else:
+            _neighbors_from_embedding(
+                adata,
+                Z_spot,
+                knn_k=knn_k,
+                backend=neighbors_backend,
+                gpu_device=neighbors_gpu_device,
+            )
         res = float(resolution) if resolution is not None else 1.0
         print(f"[cluster] Louvain, resolution={res}, knn_k={knn_k}")
         sc.tl.louvain(adata, resolution=res, key_added=key_added)
@@ -572,6 +766,8 @@ def cluster_with_method(
             "method": "louvain",
             "resolution": float(res),
             "knn_k": int(knn_k),
+            "neighbors_backend": str(neighbors_backend),
+            "scale_mode": str(scale_mode_eff),
         }
         return adata.obs[key_added].to_numpy()
 
@@ -587,12 +783,18 @@ def cluster_with_method(
             # robust_res_list should already be a list of floats
             res_list_use = [max(0.05, float(x)) for x in robust_res_list]
         else:
-            res_list_use = [max(0.05, base_res + d) for d in (-0.2, -0.1, 0.0, 0.1, 0.2)]
+            if scale_mode_eff == "small":
+                res_list_use = [max(0.05, base_res + d) for d in (-0.1, 0.0, 0.1)]
+            elif scale_mode_eff == "medium":
+                res_list_use = [max(0.05, base_res + d) for d in (-0.05, 0.05)]
+            else:
+                res_list_use = [max(0.05, base_res + d) for d in (-0.05, 0.05)]
 
         print(
             f"[cluster] Robust consensus Leiden, knn_k={knn_k}, "
             f"base_resolution={base_res}, res_list={res_list_use}, "
-            f"seeds={robust_seeds}, smooth_iter={robust_smooth_iter}, rs={robust_random_state}"
+            f"seeds={robust_seeds}, smooth_iter={robust_smooth_iter}, rs={robust_random_state}, "
+            f"neighbors_backend={neighbors_backend}, scale_mode={scale_mode_eff}"
         )
 
         # 3) n_clusters (optional)
@@ -631,6 +833,11 @@ def cluster_with_method(
             n_seeds=int(robust_seeds),
             n_smooth_iter=int(robust_smooth_iter),
             random_state=int(robust_random_state),
+            consensus_backend=robust_consensus_backend,
+            consensus_batch_size=int(robust_batch_size),
+            neighbors_backend=neighbors_backend,
+            neighbors_gpu_device=neighbors_gpu_device,
+            scale_mode=scale_mode_eff,
         )
         return labels
 
@@ -1042,6 +1249,12 @@ def main():
         default="kmeans",
     )
     parser.add_argument(
+        "--scale_mode",
+        choices=["auto", "small", "medium", "large"],
+        default="auto",
+        help="Budget preset by dataset size. 'auto' uses n_obs to choose small/medium/large.",
+    )
+    parser.add_argument(
         "--n_clusters",
         type=int,
         default=0,
@@ -1058,6 +1271,18 @@ def main():
         type=int,
         default=15,
         help="K for KNN graph on embedding.",
+    )
+    parser.add_argument(
+        "--neighbors_backend",
+        choices=["scanpy", "gpu", "auto"],
+        default="auto",
+        help="Neighbor graph backend: auto (default), scanpy, or gpu.",
+    )
+    parser.add_argument(
+        "--neighbors_gpu_device",
+        type=str,
+        default="cuda",
+        help="Torch device used by GPU neighbor backend (default: cuda).",
     )
     parser.add_argument(
         "--out_prefix",
@@ -1083,11 +1308,6 @@ def main():
         help="If set, compute ACC via Hungarian matching.",
     )
     parser.add_argument(
-        "--save_h5ad",
-        action="store_true",
-        help="If set, save AnnData with cluster labels.",
-    )
-    parser.add_argument(
         "--w_spa",
         type=float,
         default=0.4,
@@ -1102,14 +1322,14 @@ def main():
     parser.add_argument(
         "--robust_seeds",
         type=int,
-        default=5,
-        help="Robust consensus: number of random seeds (default: 5).",
+        default=3,
+        help="Robust consensus seeds (base default: 3; auto-adjusted by --scale_mode if not explicitly set).",
     )
     parser.add_argument(
         "--robust_smooth_iter",
         type=int,
-        default=2,
-        help="Robust consensus: majority smoothing iters inside consensus (default: 2).",
+        default=1,
+        help="Robust consensus smoothing iters (base default: 1; auto-adjusted by --scale_mode if not explicitly set).",
     )
     parser.add_argument(
         "--robust_random_state",
@@ -1125,6 +1345,18 @@ def main():
             "Robust consensus: comma-separated resolution list, e.g. "
             "'0.65,0.75,0.85,0.95'. If not set, auto list around --resolution."
         ),
+    )
+    parser.add_argument(
+        "--robust_consensus_backend",
+        choices=["kmeans", "minibatch"],
+        default="kmeans",
+        help="Backend for robust consensus meta clustering (base default: kmeans; auto-adjusted by --scale_mode if not explicitly set).",
+    )
+    parser.add_argument(
+        "--robust_batch_size",
+        type=int,
+        default=8192,
+        help="Batch size for robust MiniBatchKMeans (used when --robust_consensus_backend=minibatch).",
     )
     parser.add_argument(
         "--use_rep",
@@ -1351,6 +1583,30 @@ def main():
             adata.obsm[pca_key] = X_pca
             args.use_rep = pca_key
 
+    scale_mode_eff = _resolve_scale_mode(int(adata.n_obs), args.scale_mode)
+
+    if not _has_cli_flag("--knn_k"):
+        args.knn_k = 15 if scale_mode_eff == "small" else (12 if scale_mode_eff == "medium" else 10)
+
+    if not _has_cli_flag("--neighbors_backend"):
+        args.neighbors_backend = "scanpy" if scale_mode_eff == "small" else "auto"
+
+    if not _has_cli_flag("--robust_seeds"):
+        args.robust_seeds = 5 if scale_mode_eff == "small" else (3 if scale_mode_eff == "medium" else 2)
+
+    if not _has_cli_flag("--robust_smooth_iter"):
+        args.robust_smooth_iter = 1 if scale_mode_eff in ("small", "medium") else 0
+
+    if not _has_cli_flag("--robust_consensus_backend"):
+        args.robust_consensus_backend = "kmeans" if scale_mode_eff in ("small", "medium") else "minibatch"
+
+    print(
+        f"[scale] mode={scale_mode_eff}, n_obs={adata.n_obs}, "
+        f"knn_k={args.knn_k}, neighbors_backend={args.neighbors_backend}, "
+        f"robust_seeds={args.robust_seeds}, robust_smooth_iter={args.robust_smooth_iter}, "
+        f"robust_consensus_backend={args.robust_consensus_backend}"
+    )
+
     print(f"Clustering with method={args.method}...")
     adata.uns["w_spa"] = w_spa
     adata.uns["w_emb"] = w_emb
@@ -1369,6 +1625,11 @@ def main():
         robust_smooth_iter=args.robust_smooth_iter,
         robust_random_state=args.robust_random_state,
         robust_res_list=parsed_robust_res_list,
+        robust_consensus_backend=args.robust_consensus_backend,
+        robust_batch_size=args.robust_batch_size,
+        neighbors_backend=args.neighbors_backend,
+        neighbors_gpu_device=args.neighbors_gpu_device,
+        scale_mode=scale_mode_eff,
     )
 
     adata.obs["cluster"] = labels.astype(int)
@@ -1512,12 +1773,6 @@ def main():
     spatial_fig_path = args.out_prefix + f".{args.method}.spatial.png"
     plot_spatial(spatial, labels, spatial_fig_path, title=f"Spatial ({args.method})")
     print(f"Spatial plot saved to: {spatial_fig_path}")
-
-    if args.save_h5ad:
-        h5_path = args.out_prefix + f".{args.method}.h5ad"
-        adata.write_h5ad(h5_path)
-        print(f"h5ad saved to: {h5_path}")
-
 
 if __name__ == "__main__":
     main()
